@@ -186,7 +186,7 @@ def changeNotifEmail():
     emailTo = newEmail
     saveSettings()
 def changeSendingEmail():
-    global gmailFrom
+    global gmailFromn
     print("current gmail being used to send notifications: "+gmailFrom)
     newEmail = raw_input("New gmail to send notification: ")
     if(len(newEmail)<1 or '@' not in newEmail): return
