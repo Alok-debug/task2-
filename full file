@@ -1,0 +1,329 @@
+import os
+import os.path
+import re
+import time
+from datetime import datetime
+import smtplib
+from w1thermsensor import W1ThermSensor
+import sys
+from crontab import CronTab
+import subprocess
+from threading import Thread
+sensors = []
+notifTime = 10
+settingsDelim = '\n' # might want to change this
+cron_job = type('system_cron', (object,), {})()
+def clr():
+    os.system("clear")
+def replace( filePath, text, subs, flags=0 ):
+    with open( filePath, "r+" ) as file:
+        fileContents = file.read()
+        textPattern = re.compile( re.escape( text ), flags )
+        fileContents = textPattern.sub( subs, fileContents )
+        file.seek( 0 )
+        file.truncate()
+        file.write( fileContents )
+def addRemoveCron():
+    clr()
+    print("Script is added to cron jobs to run at restart: " + str(hasattr(cron_job,"is_valid") and cron_job.is_enabled()))
+    print("1. Enabled cron job to run script at reboot")
+    print("2. Disable cron job to run script at reboot")
+    choice = raw_input(">")
+    if(choice=="1"):
+        if(hasattr(cron_job,"is_valid") and cron_job.is_enabled()):
+            print("Cron job is already enabled!")
+            raw_input("Press any key to return")
+            addRemoveCron()
+        addToStartup()
+    if(choice=="2"):
+        if(hasattr(cron_job,"is_valid") and cron_job.is_enabled()):
+            removeFromStartup()
+def addToStartup():
+    global cron_job
+    system_cron = CronTab()
+    cron_job = system_cron.new(command="python /home/pi/multipleSensors.py m")
+    cron_job.every_reboot()
+    cron_job.enable()
+    system_cron.write()
+def removeFromStartup():
+    global cron_job
+    system_cron = CronTab()
+    system_cron.remove(cron_job)
+    system_cron.write()
+# Using the built in W1ThermSensor conversion instead
+#def cToF(c): # (C * 9/5) + 32 = F
+#    return (float(c)*(9.0/5.0)+32.0)
+def loadSettings():
+    global sensors
+    global houseName
+    global emailTo
+    global gmailFrom
+    global gmailPass
+    global notifTime
+if(sensors): del sensors[:]
+    sensors = []
+    f = open("tempSensors.config")
+    fc = f.read()
+    for stri in fc.split(settingsDelim):
+        if('=' not in stri): continue
+        fn = stri.split("=")[0]
+        fv = stri.split("=")[1]
+        if(fn=="houseName"): houseName = fv
+        if(fn=="emailTo"): emailTo = fv
+        if(fn=="gmailFrom"): gmailFrom = fv
+        if(fn=="gmailPass"): gmailPass = fv
+        if(fn=="notifTime"):
+            actualFv = 0
+            try:
+                actualFv = int(fv)
+            except:
+                actualFv = -1
+            if(actualFv<1): continue
+            notifTime = actualFv
+        if(fn=="sensors"): # sensors=Kitchen~abcd1234f~120~32,Living Room~09123ffff~120~32,...
+            sensorsToLoad = fv.split(",")
+            for sen in sensorsToLoad:
+                if(len(sen.split("~"))<3): continue
+                newSensor = W1ThermSensor(W1ThermSensor.THERM_SENSOR_DS18B20, sen.split("~")[1])
+                newSensor.Name = sen.split("~")[0]
+                newSensor.MaxTrig = int(sen.split("~")[2])
+                newSensor.MinTrig = int(sen.split("~")[3])
+                sensors.insert(0, newSensor)
+    f.close()
+def saveSettings():
+    f = open("tempSensors.config", 'w')
+    f.write("houseName="+houseName+"\n")
+    f.write("emailTo="+emailTo+"\n")
+    f.write("gmailFrom="+gmailFrom+"\n")
+    f.write("gmailPass="+gmailPass+"\n")
+    f.write("notifTime="+str(notifTime)+"\n")
+    f.write("sensors=")
+    for sensor in sensors:
+        f.write((sensor.Name if hasattr(sensor,"Name") else "Unnamed") + "~" + str(sensor.id) + "~" + str(sensor.MaxTrig) + "~" + str(sensor.MinTrig))
+        f.write(",")
+    f.close()
+def detectSensors(): # removes the old sensor list and fills it with alive sensors
+    global sensors
+    if(sensors): del sensors[:]
+    sensors = []
+    for sensor in W1ThermSensor.get_available_sensors():
+        sensor.MaxTrig = 120
+        sensor.MinTrig = 32
+        sensors.insert(0, sensor)
+        print("Detected sensor. ID =  %s" % (sensor.id))
+    raw_input("Press any key to return")
+def alterTriggers(sens):
+    #global triggerValues
+    print("Altering name and trigger values for sensor ID: %s\n\tTrigger high: %d, trigger low: %d" % ((sens.Name if hasattr(sens,"Name") else sens.id), sens.MaxTrig, sens.MinTrig))
+    newTriggerHigh = raw_input("Enter new trigger high (in F): ")
+    newTriggerLow = raw_input("Enter new trigger low (in F): ")
+    newSensorName = raw_input("Enter new name for sensor: ")
+    actualTriggerHi = 0
+    actualTriggerLo = 0
+    try:
+        actualTriggerHi = int(newTriggerHigh)
+        actualTriggerLo = int(newTriggerLow)
+    except:
+        actualTriggerHi = -1
+        actualTriggerLo = -1
+    if(actualTriggerHi<1 or actualTriggerLo<1 or len(newSensorName)<1): return
+    sens.MaxTrig = actualTriggerHi
+    sens.MinTrig = actualTriggerLo
+    sens.Name = newSensorName
+    saveSettings()
+def sendAlert(stri):
+    dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S %p")
+    message = "From: "+gmailFrom +"\nTo: "+emailTo+"\nSubject: Temperature sensor alert at " + houseName +"!"+"\n\n"+ dt + "\n" + stri
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.login(gmailFrom, gmailPass)
+        server.sendmail(gmailFrom, emailTo, message)
+        server.close()
+        # print("Email alert sent!") # don't print, probably will interrupt user input
+    except: # but print if theres an email issue
+        print("There was a problem sending a mail alert!")
+def storeTemps():
+    global sensors
+    #global triggerValues
+    for sensor in sensors:
+        if(sensor.get_temperature(W1ThermSensor.DEGREES_F)>=sensor.MaxTrig):
+            sendAlert((sensor.Name if hasattr(sensor, "Name") else sensor.id) + " was triggered for being too hot, reporting in at " + str(sensor.get_temperature(W1ThermSensor.DEGREES_F)))
+        if(sensor.get_temperature(W1ThermSensor.DEGREES_F)<=sensor.MinTrig):
+            sendAlert((sensor.Name if hasattr(sensor, "Name") else sensor.id) + " was triggered for being too cold, reporting in at " + str(sensor.get_temperature(W1ThermSensor.DEGREES_F)))
+def printTemps():
+    global sensors
+    inx = 0
+    for sensor in sensors:
+        print(str(inx+1) + ". Sensor ID: %s reported %f" % (((sensor.Name if hasattr(sensor, "Name") else sensor.id), sensor.get_temperature(W1ThermSensor.DEGREES_F))))
+        print("\tTrigger high: %d, trigger low: %d" % (sensor.MaxTrig, sensor.MinTrig))
+        inx+=1
+    print("5. Main menu")
+    opt = raw_input(">")
+    actualOpt = 0
+    try:
+        actualOpt = int(opt)
+    except:
+        actualOpt = -1
+    if(actualOpt<1): return
+    if(actualOpt<5): alterTriggers(sensors[actualOpt-1])
+    if(actualOpt==5): pageOne()
+    printTemps()
+def changeHouseName():
+    global houseName
+    clr()
+    print("Current house name: "+houseName)
+    newName = raw_input("New house name: ")
+    if(len(newName)<1): return
+    houseName = newName
+    saveSettings()
+def changeNotifEmail():
+    global emailTo
+    print("Current email getting notifications: "+emailTo)
+    newEmail = raw_input("New email to get notifications: ")
+    if(len(newEmail)<1 or '@' not in newEmail): return
+    emailTo = newEmail
+    saveSettings()
+def changeSendingEmail():
+    global gmailFrom
+    print("current gmail being used to send notifications: "+gmailFrom)
+    newEmail = raw_input("New gmail to send notification: ")
+    if(len(newEmail)<1 or '@' not in newEmail): return
+    gmailFrom = newEmail
+    saveSettings()
+def changeSendingPass():
+    global gmailPass
+    print("current gmail password being used to send notifications: "+gmailPass)
+    newPass = raw_input("New gmail password to send notification: ")
+    if(len(newPass)<1): return
+    gmailPass = newPass
+    saveSettings()
+def changeWaitingTime():
+    global notifTime
+    print("Current time to wait between sending notification: "+str(notifTime)+" seconds")
+    newTime = raw_input("New time to wait, in seconds, between sending notifications: ")
+    if(len(newTime)<1): return
+    actualNewTime = 0
+    try:
+        actualNewTime = int(newTime)
+    except:
+        actualNewTime = -1
+    if(actualNewTime<1): return
+    notifTime = actualNewTime
+    saveSettings()
+def emailSetup():
+    clr()
+    global emailTo
+    global gmailFrom
+    global gmailPass
+    global notifTime
+    print("1. Change email getting notifications\n\t"+emailTo)
+    print("2. Change gmail being used to send notifications\n\t"+gmailFrom)
+    print("3. Change gmail password\n\t"+gmailPass)
+    print("4. Change time to wait between notifications\n\t"+str(notifTime)+" seconds")
+    print("5. Main menu")
+    navTo = raw_input(">")
+    actualNavTo = 0
+    try:
+        actualNavTo = int(navTo)
+    except:
+        actualNavTo = -1
+    if(actualNavTo<1 or actualNavTo>5): emailSetup()
+    if(actualNavTo==1): changeNotifEmail()
+    if(actualNavTo==2): changeSendingEmail()
+    if(actualNavTo==3): changeSendingPass()
+    if(actualNavTo==4): changeWaitingTime()
+    if(actualNavTo==5): pageOne()
+    emailSetup()
+def monit():
+    while(1):
+        try:
+            time.sleep(notifTime) # sleep the number of seconds between notification sending
+            storeTemps() # evaluate temps from sensors and store em in sensorTemps
+        except KeyboardInterrupt:
+            return
+        except:
+            print("Error in monitor thread\n")
+            # don't not do nuthin;
+thre = Thread(target = monit)
+thre.daemon = True
+threRng = False
+def monitorForever():
+    global thre
+    global threRng
+    clr()
+    if(thre.isAlive()):
+        print("Monitor is running!")
+    else:
+        print("Starting to monitor, will send notifications when triggered...")
+        try:
+            thre.start()
+        except:
+            thre = Thread(target = monit)
+            thre.daemon = True
+            thre.start()
+    print("1. End monitoring")
+    print("2. Return to main menu and monitor in background")
+    try:
+        x = raw_input(">")
+    except: return # closed without properly ending thread, bad practice
+    if(x=="1"):
+        try:
+            thre._Thread__stop()
+            pageOne()
+        except: monitorForever()
+    if(x=="2"): pageOne()
+    monitorForever()
+def pageOne():
+    clr()
+    print("1. Set housee name")
+    print("\t"+houseName)
+    print("2. Setup sensors")
+    print("\t"+str(len(sensors))+" sensors active")
+    print("3. View temperature settings and values")
+    print("4. Setup notifications")
+    print("5. Run tempertature monitoring (" + ("not" if (thre.isAlive()==False) else "is") + " running!)")
+    print("6. Add or remove monitoring from cron jobs")
+    print("7. Save and exit")
+    try:
+        navTo = raw_input(">")
+    except:
+        return # exiting without properly closing threads, bad practice
+    navToActual = 0
+    try:
+        navToActual = int(navTo)
+    except:
+        navToActual = -1
+    if(navToActual<1 or navToActual > 7):
+        pageOne() # back to page 1
+    if(navToActual==1):
+        changeHouseName()
+    if(navToActual==2):
+        detectSensors()
+    if(navToActual==3):
+        printTemps()
+    if(navToActual==4): emailSetup()
+    if(navToActual==5):
+        monitorForever()
+    if(navToActual==6):
+        addRemoveCron()
+    if(navToActual==7):
+        saveSettings()
+        if(thre.isAlive()): thre._Thread__stop()
+        exit(0)
+    pageOne()
+pc = "ps -ef | grep -v grep | grep multipleSensors.py | grep -v sudo | grep -v " + str(os.getpid())
+process_exists = os.system(pc)
+if(process_exists==0):
+    print("Please only run 1 instance at a time!")
+    exit(0)
+if(len(sys.argv)>1 and sys.argv[1]=="m"):
+    #time.sleep(20)
+    if(os.path.isfile("tempSensors.config")): loadSettings()
+    if(thre.isAlive()):
+        print("Already monitoring!")
+    else:
+thre.start()
+if(os.path.isfile("tempSensors.config")): loadSettings()
+pageOne()
